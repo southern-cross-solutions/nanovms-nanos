@@ -17,6 +17,7 @@ typedef struct direct {
     struct list conn_head;
     closure_struct(thunk, receive_service);
     u32 receive_service_scheduled;
+    boolean closed;
 } *direct;
 
 #define DIRECT_CONN_RECEIVE_QUEUE_SIZE 1024
@@ -31,6 +32,7 @@ typedef struct direct_conn {
     input_buffer_handler receive_bh;
     queue receive_queue;
     err_t pending_err;          /* lwIP */
+    boolean done;
 } *direct_conn;
 
 /* suppose this could store a completion if a client needs it */
@@ -39,13 +41,24 @@ typedef struct qbuf {
     buffer b;
 } *qbuf;
 
-static boolean direct_conn_closed(direct_conn dc);
+typedef enum {
+    direct_conn_closed_continue,
+    direct_conn_closed_client,
+} direct_conn_closed_result;
+
+static void direct_dealloc(direct d);
+static direct_conn_closed_result direct_conn_closed(direct_conn dc);
 
 closure_func_basic(thunk, void, direct_receive_service)
 {
     direct d = struct_from_closure(direct, receive_service);
-    d->receive_service_scheduled = 0;
     spin_lock(&d->conn_lock);
+    if (d->closed) {
+        compare_and_swap_32(&d->receive_service_scheduled, 1, 0);
+        spin_unlock(&d->conn_lock);
+        direct_dealloc(d);
+        return;
+    }
     list_foreach(&d->conn_head, l) {
         direct_conn dc = struct_from_list(l, direct_conn, l);
         if (!dc->receive_bh) {
@@ -55,9 +68,8 @@ closure_func_basic(thunk, void, direct_receive_service)
                 tcp_arg(dc->p, 0);
                 tcp_close(dc->p);
                 tcp_unlock(dc->p);
-                boolean done = direct_conn_closed(dc);
-                if (done)
-                    return;
+                if (direct_conn_closed(dc) == direct_conn_closed_client)
+                    goto service_exit;
                 continue;
             }
             dc->receive_bh = bh;
@@ -69,6 +81,10 @@ closure_func_basic(thunk, void, direct_receive_service)
             if (p == INVALID_ADDRESS)
                 break;
             if (p) {
+                if (dc->done) {
+                    pbuf_free(p);
+                    continue;
+                }
                 buffer b = alloca_wrap_buffer(p->payload, p->len);
                 boolean done = apply(ibh, b);
                 if (!done) {
@@ -91,15 +107,34 @@ closure_func_basic(thunk, void, direct_receive_service)
                 pbuf_free(p);
                 if (done) {
                     if (client)
-                        return;
-                    break;
+                        dc->done = true;
+                    else
+                        break;
                 }
             } else {
-                boolean done = direct_conn_closed(dc);
-                if (done)
-                    return;
+                if (direct_conn_closed(dc) == direct_conn_closed_client)
+                    goto service_exit;
                 break;
             }
+        }
+    }
+  service_exit:
+    compare_and_swap_32(&d->receive_service_scheduled, 1, 0);
+    if (d->closed) {
+        if (d->receive_service_scheduled == 0) {
+            spin_unlock(&d->conn_lock);
+            direct_dealloc(d);
+            return;
+        }
+        spin_unlock(&d->conn_lock);
+        return;
+    }
+    list_foreach(&d->conn_head, l) {
+        direct_conn dc = struct_from_list(l, direct_conn, l);
+        if (!queue_empty(dc->receive_queue)) {
+            if (compare_and_swap_32(&d->receive_service_scheduled, 0, 1))
+                async_apply((thunk)&d->receive_service);
+            break;
         }
     }
     spin_unlock(&d->conn_lock);
@@ -121,6 +156,7 @@ static direct direct_alloc(heap h, connection_handler ch)
     list_init(&d->conn_head);
     init_closure_func(&d->receive_service, thunk, direct_receive_service);
     d->receive_service_scheduled = 0;
+    d->closed = false;
     d->new = ch;
     tcp_arg(d->p, d);
     tcp_ref(d->p);
@@ -140,13 +176,14 @@ static void direct_dealloc(direct d)
     deallocate(d->h, d, sizeof(struct direct));
 }
 
-/* lwIP locked on entry */
-static boolean direct_conn_closed(direct_conn dc)
+/* conn_lock held on entry; this is the only place a connection is freed */
+static direct_conn_closed_result direct_conn_closed(direct_conn dc)
 {
     if (dc->receive_bh)
         apply(dc->receive_bh, 0);
     direct d = dc->d;
     boolean client = (d->p == 0);
+    spin_lock(&dc->send_lock);
     tcp_unref(dc->p);
     list_delete(&dc->l);
     heap h = dc->d->h;
@@ -165,9 +202,24 @@ static boolean direct_conn_closed(direct_conn dc)
     }
     deallocate_queue(dc->receive_queue);
     deallocate(h, dc, sizeof(struct direct_conn));
-    if (client)
-        direct_dealloc(d);
-    return client;
+    if (!client)
+        return direct_conn_closed_continue;
+    d->closed = true;
+    return direct_conn_closed_client;
+}
+
+static void direct_conn_enqueue_locked(direct_conn dc, struct pbuf *p)
+{
+    assert(enqueue(dc->receive_queue, p));
+    if (compare_and_swap_32(&dc->d->receive_service_scheduled, 0, 1))
+        async_apply((thunk)&dc->d->receive_service);
+}
+
+static void direct_conn_enqueue(direct_conn dc, struct pbuf *p)
+{
+    spin_lock(&dc->send_lock);
+    direct_conn_enqueue_locked(dc, p);
+    spin_unlock(&dc->send_lock);
 }
 
 static void direct_conn_send_internal(direct_conn dc, qbuf q, boolean lwip_locked)
@@ -195,7 +247,8 @@ static void direct_conn_send_internal(direct_conn dc, qbuf q, boolean lwip_locke
                 tcp_unlock(dc->p);
             list_delete(&q->l);
             deallocate(dc->d->h, q, sizeof(struct qbuf));
-            direct_conn_closed(dc);
+            direct_conn_enqueue_locked(dc, 0);
+            spin_unlock(&dc->send_lock);
             dc = 0;
             break;
         }
@@ -230,9 +283,9 @@ static void direct_conn_send_internal(direct_conn dc, qbuf q, boolean lwip_locke
         }
     }
     if (dc) {
-        spin_unlock(&dc->send_lock);
         if (!lwip_locked)
             tcp_unlock(dc->p);
+        spin_unlock(&dc->send_lock);
     }
 }
 
@@ -260,13 +313,6 @@ closure_func_basic(buffer_handler, status, direct_conn_send,
         direct_conn_send_internal(dc, q, false);
     }
     return s;
-}
-
-static void direct_conn_enqueue(direct_conn dc, struct pbuf *p)
-{
-    assert(enqueue(dc->receive_queue, p));
-    if (compare_and_swap_32(&dc->d->receive_service_scheduled, 0, 1))
-        async_apply((thunk)&dc->d->receive_service);
 }
 
 err_t direct_conn_input(void *z, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
@@ -308,6 +354,7 @@ static direct_conn direct_conn_alloc(direct d, struct tcp_pcb *pcb)
     if (dc->receive_queue == INVALID_ADDRESS)
         goto fail_dealloc;
     dc->pending_err = ERR_OK;
+    dc->done = false;
     if (pcb == d->p)
         d->p = 0;
     else
