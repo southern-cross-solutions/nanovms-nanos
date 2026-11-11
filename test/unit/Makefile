@@ -10,6 +10,7 @@ PROGRAMS= \
 	bitmap_test \
 	buffer_test \
 	closure_test \
+	direct_test \
 	id_heap_test \
 	memops_test \
 	network_test \
@@ -41,6 +42,13 @@ SRCS-closure_test= \
 	$(CURDIR)/closure_test.c \
 	$(RUNTIME)\
 	$(SRCDIR)/unix_process/unix_process_runtime.c
+
+SRCS-direct_test= \
+	$(CURDIR)/direct_test.c \
+	$(RUNTIME)\
+	$(SRCDIR)/unix_process/unix_process_runtime.c
+
+CFLAGS-direct_test.c=	-I$(CURDIR)/direct_test
 
 SRCS-id_heap_test= \
 	$(CURDIR)/id_heap_test.c \

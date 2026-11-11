@@ -193,9 +193,13 @@ SRCS-umcg= \
 endif
 
 KLIBS+= \
+	test/direct_close \
 	test/klib \
 	test/lock \
 	test/page_table \
+
+SRCS-test/direct_close= \
+	$(KLIB_DIR)/test/direct_close.c
 
 SRCS-test/klib= \
 	$(KLIB_DIR)/test/klib.c
