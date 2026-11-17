@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -81,6 +82,38 @@ func cloudPrebuild(t *testing.T) {
 	}()
 }
 
+func directClosePrebuild(t *testing.T) {
+	goPrebuild(t)
+	go func() {
+		ln, err := net.Listen("tcp", ":8081")
+		if err != nil {
+			fmt.Println("Error starting direct_close server", err)
+			return
+		}
+		defer ln.Close()
+		for i := 0; i < 20; i++ {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			var req bytes.Buffer
+			buf := make([]byte, 512)
+			for !bytes.Contains(req.Bytes(), []byte("\r\n\r\n")) {
+				n, err := conn.Read(buf)
+				if n > 0 {
+					req.Write(buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"))
+			conn.Close()
+		}
+	}()
+}
+
 func rustPrebuild(t *testing.T) {
 	effect, err := exec.Command("/bin/bash", "-c", "rustc http_server.rs -o main").CombinedOutput()
 	if err != nil {
@@ -118,6 +151,7 @@ func testPackages(t *testing.T) {
 		elf      string
 		prebuild func(t *testing.T)
 		postrun  func(t *testing.T)
+		expect   string
 		skip     bool
 		nocross  bool
 		data     interface{}
@@ -128,6 +162,8 @@ func testPackages(t *testing.T) {
 		{name: "ruby_alloc", pkg: "eyberg/ruby:3.1.2", dir: "ruby_alloc"},
 		{name: "python_alloc", pkg: "eyberg/python:3.10.6", dir: "python_alloc"},
 		{name: "cloud_init", dir: "cloud_init", elf: "main", prebuild: cloudPrebuild},
+		{name: "direct_close", dir: "direct_close", elf: "main", prebuild: directClosePrebuild,
+			expect: "direct close test: OK"},
 		{name: "python_3.6.7", pkg: "eyberg/python:3.6.7", dir: "python_3.6.7", request: "http://0.0.0.0:8000"},
 		{name: "node_v11.5.0", pkg: "eyberg/node:v11.5.0", dir: "node_v11.5.0", request: "http://0.0.0.0:8083"},
 		{name: "nginx_1.15.6", pkg: "eyberg/nginx:1.15.6", dir: "nginx_1.15.6", request: "http://0.0.0.0:8084"},
@@ -195,6 +231,10 @@ func testPackages(t *testing.T) {
 				}
 				if r != 0 {
 					err = fmt.Errorf("ops exit code %d", r)
+					goto fatalrun
+				}
+				if tt.expect != "" && !strings.Contains(buffer.String(), tt.expect) {
+					err = fmt.Errorf("expected output %q not found", tt.expect)
 					goto fatalrun
 				}
 				re = regexp.MustCompile("exit status [0-9]+")
